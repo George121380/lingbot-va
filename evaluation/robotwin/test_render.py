@@ -19,6 +19,8 @@ import toppra as ta
 import transforms3d as t3d
 from collections import OrderedDict
 
+from evaluation.robotwin.render_config import configure_sapien_ray_tracing
+
 import sys
 import warnings
 import os
@@ -39,6 +41,10 @@ import gymnasium as gym
 import toppra as ta
 import transforms3d as t3d
 from collections import OrderedDict
+
+from evaluation.robotwin.render_config import configure_sapien_ray_tracing
+
+configure_sapien_ray_tracing()
 
 
 class Sapien_TEST(gym.Env):

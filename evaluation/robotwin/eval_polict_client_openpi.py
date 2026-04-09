@@ -6,7 +6,39 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cv2
 from pathlib import Path
 
-robowin_root = Path("/path/to/your/robowin")
+def resolve_robowin_root() -> Path:
+    env_root = os.environ.get("ROBOTWIN_ROOT")
+    if env_root:
+        root = Path(env_root).expanduser()
+    else:
+        root = Path(__file__).resolve().parents[3] / "RoboTwin"
+    root = root.resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"RoboTwin root not found: {root}")
+    return root
+
+
+def sync_embodiment_asset_paths(root: Path) -> None:
+    embodiments_root = root / "assets" / "embodiments"
+    if not embodiments_root.is_dir():
+        raise FileNotFoundError(f"RoboTwin embodiments directory not found: {embodiments_root}")
+
+    for template_path in embodiments_root.rglob("*_tmp.yml"):
+        target_path = template_path.with_name(template_path.name.replace("_tmp.yml", ".yml"))
+        template_text = template_path.read_text(encoding="utf-8")
+        rendered_text = template_text.replace("${ASSETS_PATH}", str(root)).replace("$ASSETS_PATH", str(root))
+
+        if target_path.exists() and target_path.read_text(encoding="utf-8") == rendered_text:
+            continue
+
+        tmp_path = target_path.with_name(f".{target_path.name}.{os.getpid()}.tmp")
+        tmp_path.write_text(rendered_text, encoding="utf-8")
+        os.replace(tmp_path, target_path)
+
+
+robowin_root = resolve_robowin_root()
+os.environ.setdefault("ROBOTWIN_ROOT", str(robowin_root))
+sync_embodiment_asset_paths(robowin_root)
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
 
@@ -28,6 +60,7 @@ import importlib
 import argparse
 import pdb
 from evaluation.robotwin.geometry import euler2quat
+from evaluation.robotwin.render_config import configure_sapien_ray_tracing
 import numpy as np
 
 from description.utils.generate_episode_instructions import *
@@ -39,6 +72,8 @@ from pathlib import Path
 from scipy.spatial.transform import Rotation as R
 import json
 from pathlib import Path
+
+configure_sapien_ray_tracing()
 
 from evaluation.robotwin.websocket_client_policy import WebsocketClientPolicy
 from evaluation.robotwin.test_render import Sapien_TEST
@@ -697,4 +732,3 @@ if __name__ == "__main__":
     Sapien_TEST()
     usr_args = parse_args_and_config()
     main(usr_args)
-

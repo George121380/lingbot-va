@@ -58,6 +58,9 @@ class VA_Server:
         self.scheduler.set_timesteps(1000, training=True)
         self.action_scheduler.set_timesteps(1000, training=True)
 
+        self._validate_pretrained_model_dir(
+            job_config.wan22_pretrained_model_name_or_path)
+
         self.vae = load_vae(
             os.path.join(job_config.wan22_pretrained_model_name_or_path,
                          'vae'),
@@ -82,7 +85,7 @@ class VA_Server:
                          'transformer'),
             torch_dtype=self.dtype,
             torch_device=self.device,
-            attn_mode="torch"
+            attn_mode="torch",
         )
         shard_fn = shard_model
         self.transformer = _configure_model(model=self.transformer,
@@ -102,6 +105,24 @@ class VA_Server:
                 torch_device='cpu' if self.enable_offload else self.device,
             )
             self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
+
+    @staticmethod
+    def _validate_pretrained_model_dir(model_root):
+        required_files = (
+            os.path.join(model_root, "vae", "config.json"),
+            os.path.join(model_root, "text_encoder", "config.json"),
+            os.path.join(model_root, "tokenizer", "tokenizer_config.json"),
+            os.path.join(model_root, "transformer", "config.json"),
+        )
+        missing_files = [path for path in required_files if not os.path.isfile(path)]
+        if missing_files:
+            missing_text = "\n".join(missing_files)
+            raise FileNotFoundError(
+                "Invalid local pretrained model directory: "
+                f"{model_root}\nMissing required files:\n{missing_text}\n"
+                "Set LINGBOT_VA_MODEL_PATH to the checkpoint root directory "
+                "that contains vae/, text_encoder/, tokenizer/, and transformer/."
+            )
 
     def _get_t5_prompt_embeds(
         self,

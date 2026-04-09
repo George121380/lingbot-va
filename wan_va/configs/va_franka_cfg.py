@@ -2,13 +2,16 @@
 import torch
 from easydict import EasyDict
 
-from .shared_config import va_shared_cfg
+from .shared_config import resolve_pretrained_model_path, va_shared_cfg
 
 va_franka_cfg = EasyDict(__name__='Config: VA franka')
 va_franka_cfg.update(va_shared_cfg)
 va_shared_cfg.infer_mode = 'server'
 
-va_franka_cfg.wan22_pretrained_model_name_or_path = "/path/to/pretrained/model"
+va_franka_cfg.wan22_pretrained_model_name_or_path = resolve_pretrained_model_path(
+    "lingbot-va-base",
+    "lingbot-va-posttrain-robotwin",
+)
 
 va_franka_cfg.attn_window = 30
 va_franka_cfg.frame_chunk_size = 4

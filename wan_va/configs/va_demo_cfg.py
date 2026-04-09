@@ -2,13 +2,16 @@
 import torch
 from easydict import EasyDict
 
-from .shared_config import va_shared_cfg
+from .shared_config import resolve_pretrained_model_path, va_shared_cfg
 
 va_demo_cfg = EasyDict(__name__='Config: VA demo')
 va_demo_cfg.update(va_shared_cfg)
 va_shared_cfg.infer_mode = 'server'
 
-va_demo_cfg.wan22_pretrained_model_name_or_path = "/path/to/pretrained/model"
+va_demo_cfg.wan22_pretrained_model_name_or_path = resolve_pretrained_model_path(
+    "lingbot-va-base",
+    "lingbot-va-posttrain-robotwin",
+)
 
 va_demo_cfg.attn_window = 30
 va_demo_cfg.frame_chunk_size = 4
