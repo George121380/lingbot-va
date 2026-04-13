@@ -125,11 +125,6 @@ def construct_lerobot_multi_processor(config,
             continue
         valid_datasets.append(result["dataset"])
 
-    if not valid_datasets:
-        raise RuntimeError(
-            f"Failed to initialize any LeRobot datasets under {config.dataset_path}"
-        )
-
     report_path = _write_dataset_report(config, repo_list, valid_datasets,
                                         skipped_datasets)
 
@@ -167,6 +162,14 @@ def construct_lerobot_multi_processor(config,
                     "Training is in strict mode. Set LINGBOT_VA_ALLOW_INCOMPLETE_DATASETS=1 only for smoke tests on partial data.",
                 )
             raise RuntimeError("\n".join(summary_lines))
+
+    if not valid_datasets:
+        message_lines = [
+            f"Failed to initialize any LeRobot datasets under {config.dataset_path}.",
+        ]
+        if report_path is not None:
+            message_lines.append(f"Detailed report: {report_path}")
+        raise RuntimeError("\n".join(message_lines))
 
     return valid_datasets
 
@@ -284,6 +287,7 @@ class LatentLeRobotDataset(LeRobotDataset):
 
     def parse_meta(self):
         out = []
+        missing_segments = []
         for key, value in self.meta.episodes.items():
             episode_index = value["episode_index"]
             tasks = value["tasks"]
@@ -295,27 +299,58 @@ class LatentLeRobotDataset(LeRobotDataset):
                 }
                 cur_meta.update(acfg)
 
-                check_statu = self._check_meta(
+                missing_files = self._check_meta(
                     cur_meta["start_frame"],
                     cur_meta["end_frame"],
                     cur_meta["episode_index"],
                 )
 
-                if check_statu:
-                    out.append(cur_meta)
+                if missing_files:
+                    missing_segments.append({
+                        "episode_index": episode_index,
+                        "start_frame": cur_meta["start_frame"],
+                        "end_frame": cur_meta["end_frame"],
+                        "missing_files": missing_files,
+                    })
+                    continue
+
+                out.append(cur_meta)
+
+        if missing_segments and not getattr(self.config,
+                                            "allow_incomplete_datasets",
+                                            False):
+            summary_lines = [
+                f"Found {len(missing_segments)} action segments with missing latent files under {self.repo_id}.",
+            ]
+            for segment in missing_segments[:10]:
+                summary_lines.append(
+                    f"episode {segment['episode_index']} "
+                    f"{segment['start_frame']}:{segment['end_frame']} missing:"
+                )
+                for missing_file in segment["missing_files"][:3]:
+                    summary_lines.append(f"  {missing_file}")
+                remaining_files = len(segment["missing_files"]) - 3
+                if remaining_files > 0:
+                    summary_lines.append(f"  ... and {remaining_files} more files")
+            remaining_segments = len(missing_segments) - 10
+            if remaining_segments > 0:
+                summary_lines.append(f"... and {remaining_segments} more segments")
+            raise IncompleteDatasetShardError("\n".join(summary_lines))
+
         self.new_metas = out
 
     def _check_meta(self, start_frame, end_frame, episode_index):
         episode_chunk = self.meta.get_episode_chunk(episode_index)
         latent_path = Path(self.latent_path) / f"chunk-{episode_chunk:03d}"
+        missing_files = []
         for key in self.used_video_keys:
             cur_path = latent_path / key
             latent_file = (
                 cur_path / f"episode_{episode_index:06d}_{start_frame}_{end_frame}.pth"
             )
             if not os.path.exists(latent_file):
-                return False
-        return True
+                missing_files.append(str(latent_file))
+        return missing_files
 
     def _get_global_idx(self, episode_index: int, local_index: int):
         ep_start = self.episode_data_index["from"][episode_index]
