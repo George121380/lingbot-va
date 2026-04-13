@@ -148,11 +148,10 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.used_video_keys = config.obs_cam_keys
         self.q01 = np.array(config.norm_stat['q01'], dtype='float')[None]
         self.q99 = np.array(config.norm_stat['q99'], dtype='float')[None]
-        self._hf_torch_view = self.hf_dataset.with_format(
-                type='torch',
-                columns=['action'],
-                output_all_columns=False
-            )
+        # Keep the HF dataset action-only and avoid datasets' torch formatter:
+        # in some torchvision builds the formatter imports VideoReader even
+        # though LingBot-VA trains from precomputed latents, not raw videos.
+        self._hf_action_view = self.hf_dataset.select_columns(['action'])
         self.parse_meta()
 
     def parse_meta(self):
@@ -195,8 +194,11 @@ class LatentLeRobotDataset(LeRobotDataset):
         return local_index + ep_start
 
     def _get_range_hf_data(self, start_frame, end_frame):
-        batch = self._hf_torch_view[start_frame:end_frame]
-        return batch
+        batch = self._hf_action_view[start_frame:end_frame]
+        return {
+            'action':
+            torch.from_numpy(np.asarray(batch['action'], dtype=np.float32))
+        }
 
     def _flatten_latent_dict(self, latent_dict):
         out = {}
@@ -255,12 +257,22 @@ class LatentLeRobotDataset(LeRobotDataset):
     
     def _action_post_process(self, local_start_frame, local_end_frame, latent_frame_ids, action):
         act_shift = int(latent_frame_ids[0] - local_start_frame)
-        frame_stride = latent_frame_ids[1] - latent_frame_ids[0]
+        frame_stride = latent_frame_ids[1] - latent_frame_ids[0] if len(latent_frame_ids) > 1 else 1
+        if torch.is_tensor(action):
+            action = action.detach().cpu().numpy()
+        else:
+            action = np.asarray(action)
         action = action[act_shift:]
         if self.config.env_type == 'robotwin_tshape': ## TODO support get_relative_pose for other dataset, currently only support robotwin 
             left_action = get_relative_pose(action[:, :7])
             right_action = get_relative_pose(action[:, 8:15])
             action = np.concatenate([left_action, action[:, 7:8], right_action, action[:, 15:16]], axis=1)
+        elif self.config.env_type == 'dex_zarr':
+            if action.shape[-1] != self.config.action_dim:
+                raise ValueError(
+                    f"dex_zarr action dim mismatch: parquet action has {action.shape[-1]} dims, "
+                    f"but config.action_dim={self.config.action_dim}"
+                )
         action = np.pad(action, pad_width=((frame_stride * 4, 0), (0, 0)), mode='constant', constant_values=0)
 
         latent_frame_num = (len(latent_frame_ids) - 1) // 4 + 1
