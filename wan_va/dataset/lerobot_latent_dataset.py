@@ -7,13 +7,22 @@ from pathlib import Path
 from collections.abc import Callable
 import os
 from tqdm import tqdm
-from multiprocessing import Pool
+from multiprocessing import Pool, get_context
 from functools import partial
 import torch
 from einops import rearrange
 from torch.utils.data import DataLoader
 from scipy.spatial.transform import Rotation as R
 from lerobot.constants import HF_LEROBOT_HOME
+import json
+
+
+class DatasetShardError(RuntimeError):
+    """Base error raised while initializing a single LeRobot shard."""
+
+
+class IncompleteDatasetShardError(DatasetShardError):
+    """The shard is missing files required for training."""
 
 def recursive_find_file(directory, filename='info.json'):
     result = []
@@ -37,20 +46,129 @@ def construct_lerobot(
         config=config,
     )
 
+
+def construct_lerobot_safe(repo_id, config):
+    try:
+        return {
+            "repo_id": repo_id,
+            "dataset": construct_lerobot(repo_id=repo_id, config=config),
+            "error": None,
+            "recoverable": False,
+        }
+    except Exception as exc:
+        return {
+            "repo_id": repo_id,
+            "dataset": None,
+            "error": f"{type(exc).__name__}: {exc}",
+            "recoverable": isinstance(exc, IncompleteDatasetShardError),
+        }
+
+
+def _dataset_report_path(config):
+    report_path = getattr(config, "dataset_init_report_path", "")
+    if report_path:
+        return Path(report_path).expanduser().resolve()
+    save_root = getattr(config, "save_root", "./train_out")
+    return (Path(save_root) / "dataset_init_report.json").resolve()
+
+
+def _write_dataset_report(config, repo_list, valid_datasets, skipped_datasets):
+    if getattr(config, "rank", 0) != 0:
+        return None
+
+    report_path = _dataset_report_path(config)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report = {
+        "dataset_path": str(config.dataset_path),
+        "allow_incomplete_datasets": bool(
+            getattr(config, "allow_incomplete_datasets", False)),
+        "discovered_repo_count": len(repo_list),
+        "initialized_repo_count": len(valid_datasets),
+        "failed_repo_count": len(skipped_datasets),
+        "failures": skipped_datasets,
+    }
+    with report_path.open("w") as f:
+        json.dump(report, f, indent=2)
+    return report_path
+
+
 def construct_lerobot_multi_processor(config, 
                                       num_init_worker=8,
                                       ):
     datasets_out_lst = []
     construct_func = partial(
-        construct_lerobot,
+        construct_lerobot_safe,
         config=config,
     )
     repo_list = recursive_find_file(config.dataset_path, 'info.json')
-    repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
-    with Pool(num_init_worker) as pool:
-        datasets_out_lst = pool.map(construct_func, repo_list)
-                
-    return datasets_out_lst
+    repo_list = sorted(v.split('/meta/info.json')[0] for v in repo_list)
+    if not repo_list:
+        raise RuntimeError(
+            f"No LeRobot datasets were found under {config.dataset_path}")
+    if num_init_worker <= 1:
+        datasets_out_lst = [construct_func(repo_id) for repo_id in repo_list]
+    else:
+        # Dataset discovery runs after CUDA/FSDP initialization in training, so
+        # using spawn avoids forking a process that already owns CUDA context.
+        with get_context("spawn").Pool(num_init_worker) as pool:
+            datasets_out_lst = pool.map(construct_func, repo_list)
+
+    valid_datasets = []
+    skipped_datasets = []
+    for result in datasets_out_lst:
+        if result["dataset"] is None:
+            skipped_datasets.append({
+                "repo_id": result["repo_id"],
+                "error": result["error"],
+                "recoverable": result["recoverable"],
+            })
+            continue
+        valid_datasets.append(result["dataset"])
+
+    if not valid_datasets:
+        raise RuntimeError(
+            f"Failed to initialize any LeRobot datasets under {config.dataset_path}"
+        )
+
+    report_path = _write_dataset_report(config, repo_list, valid_datasets,
+                                        skipped_datasets)
+
+    if skipped_datasets:
+        all_recoverable = all(result["recoverable"] for result in skipped_datasets)
+        allow_incomplete = bool(
+            getattr(config, "allow_incomplete_datasets", False))
+        summary_lines = [
+            f"Detected {len(skipped_datasets)} dataset shard failures while scanning {config.dataset_path}.",
+        ]
+        if report_path is not None:
+            summary_lines.append(f"Detailed report: {report_path}")
+        for result in skipped_datasets[:10]:
+            summary_lines.append(f"- {result['repo_id']}: {result['error']}")
+        remaining = len(skipped_datasets) - 10
+        if remaining > 0:
+            summary_lines.append(f"... and {remaining} more")
+
+        if allow_incomplete and all_recoverable:
+            print(
+                "Skipping incomplete LeRobot datasets because "
+                "LINGBOT_VA_ALLOW_INCOMPLETE_DATASETS=1:")
+            details_start = 2 if report_path is not None else 1
+            for line in summary_lines[details_start:]:
+                print(f"  {line}")
+        else:
+            if allow_incomplete and not all_recoverable:
+                summary_lines.insert(
+                    1,
+                    "At least one failure is not a missing/incomplete-shard error, so training will stop.",
+                )
+            else:
+                summary_lines.insert(
+                    1,
+                    "Training is in strict mode. Set LINGBOT_VA_ALLOW_INCOMPLETE_DATASETS=1 only for smoke tests on partial data.",
+                )
+            raise RuntimeError("\n".join(summary_lines))
+
+    return valid_datasets
 
 def get_relative_pose(pose):
     if torch.is_tensor(pose):
@@ -71,8 +189,11 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         config,
-        num_init_worker=128,
+        num_init_worker=None,
     ):
+        if num_init_worker is None:
+            num_init_worker = getattr(config, 'num_init_worker', 8)
+        num_init_worker = max(1, min(int(num_init_worker), os.cpu_count() or 1))
         self._datasets = construct_lerobot_multi_processor(config, 
                                                            num_init_worker, 
                                                            )
@@ -136,9 +257,10 @@ class LatentLeRobotDataset(LeRobotDataset):
             assert all((self.root / fpath).is_file() for fpath in self.get_episodes_file_paths())
             self.hf_dataset = self.load_hf_dataset()
         except (AssertionError, FileNotFoundError, NotADirectoryError):
-            self.revision = get_safe_version(self.repo_id, self.revision)
-            self.download_episodes(download_videos)
-            self.hf_dataset = self.load_hf_dataset()
+            raise IncompleteDatasetShardError(
+                f"Dataset files are incomplete under {self.root}. "
+                "Finish the download or allow this shard to be skipped."
+            )
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
         
         self.latent_path = Path(repo_id) / 'latents'
@@ -153,6 +275,12 @@ class LatentLeRobotDataset(LeRobotDataset):
         # though LingBot-VA trains from precomputed latents, not raw videos.
         self._hf_action_view = self.hf_dataset.select_columns(['action'])
         self.parse_meta()
+        if not self.new_metas:
+            raise IncompleteDatasetShardError(
+                f"No usable latent/action segments found under {repo_id}")
+
+    def __len__(self):
+        return len(self.new_metas)
 
     def parse_meta(self):
         out = []

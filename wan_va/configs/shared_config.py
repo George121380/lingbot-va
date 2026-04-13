@@ -17,6 +17,11 @@ def _is_pretrained_model_root(path):
                for subdir, filename in required_files)
 
 
+def _is_dataset_root(path, required_files=("empty_emb.pt", )):
+    return path.is_dir() and all((path / filename).is_file()
+                                 for filename in required_files)
+
+
 def resolve_pretrained_model_path(*candidate_paths):
     env_path = (os.getenv("LINGBOT_VA_MODEL_PATH")
                 or os.getenv("WAN22_PRETRAINED_MODEL_NAME_OR_PATH"))
@@ -54,6 +59,43 @@ def resolve_pretrained_model_path(*candidate_paths):
         return str((repo_root.parent / "download" / fallback_path).resolve())
 
     return "/path/to/pretrained/model"
+
+
+def resolve_dataset_path(*candidate_paths, env_var="LINGBOT_VA_DATASET_PATH"):
+    env_path = os.getenv(env_var)
+    if env_path:
+        return os.path.abspath(os.path.expanduser(env_path))
+
+    repo_root = Path(__file__).resolve().parents[2]
+    search_roots = (
+        repo_root,
+        repo_root / "download",
+        repo_root.parent,
+        repo_root.parent / "download",
+        Path.cwd(),
+        Path.cwd() / "download",
+        Path.cwd().parent,
+        Path.cwd().parent / "download",
+    )
+
+    for candidate_path in candidate_paths:
+        expanded_path = Path(candidate_path).expanduser()
+        if expanded_path.is_absolute() and _is_dataset_root(expanded_path):
+            return str(expanded_path.resolve())
+
+        for root in search_roots:
+            resolved_path = (expanded_path if expanded_path.is_absolute() else
+                             (root / expanded_path))
+            if _is_dataset_root(resolved_path):
+                return str(resolved_path.resolve())
+
+    if candidate_paths:
+        fallback_path = Path(candidate_paths[0]).expanduser()
+        if fallback_path.is_absolute():
+            return str(fallback_path)
+        return str((repo_root.parent / "download" / fallback_path).resolve())
+
+    return "/path/to/your/dataset"
 
 va_shared_cfg = EasyDict()
 

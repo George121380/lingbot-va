@@ -3,7 +3,6 @@ import argparse
 import os
 import sys
 from pathlib import Path
-import wandb
 
 import torch
 import torch.distributed as dist
@@ -49,19 +48,8 @@ import gc
 
 class Trainer:
     def __init__(self, config):
-        if config.enable_wandb and config.rank == 0:
-            wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
-            self.wandb = wandb
-            self.wandb.init(
-                entity=os.environ["WANDB_TEAM_NAME"],
-                project=os.getenv("WANDB_PROJECT", "va_robotwin"),
-                # dir=log_dir,
-                config=config,
-                mode="online",
-                name='test_lln'
-                # name=os.path.basename(os.path.normpath(job_config.job.dump_folder))
-            )
-            logger.info("WandB logging enabled")
+        self.wandb = None
+        self._init_wandb(config)
         self.step = 0
         self.config = config
         self.device = torch.device(f"cuda:{config.local_rank}")
@@ -146,6 +134,56 @@ class Trainer:
         self.train_loader_iter = None
         # if hasattr(config, 'resume_from') and config.resume_from:
         #     self._load_training_state(config.resume_from)
+
+    def _init_wandb(self, config):
+        if not config.enable_wandb or config.rank != 0:
+            return
+
+        try:
+            import wandb
+        except Exception as exc:
+            logger.warning(f"W&B import failed, disabling logging: {exc}")
+            return
+
+        mode = os.getenv("WANDB_MODE", "online").strip().lower()
+        base_url = os.getenv("WANDB_BASE_URL", "").strip()
+        api_key = os.getenv("WANDB_API_KEY", "").strip()
+        team_name = os.getenv("WANDB_TEAM_NAME", "").strip()
+
+        if mode == "online":
+            if api_key and api_key.lower() != "your key":
+                login_kwargs = {"key": api_key}
+                if base_url and base_url.lower() != "your url":
+                    login_kwargs["host"] = base_url
+                try:
+                    wandb.login(**login_kwargs)
+                except Exception as exc:
+                    logger.warning(
+                        f"W&B login failed, falling back to offline mode: {exc}"
+                    )
+                    mode = "offline"
+            else:
+                logger.warning(
+                    "W&B credentials are not configured, falling back to offline mode."
+                )
+                mode = "offline"
+
+        init_kwargs = {
+            "project": os.getenv("WANDB_PROJECT", "va_robotwin"),
+            "config": dict(config),
+            "mode": mode,
+            "name": os.getenv("WANDB_RUN_NAME", "test_lln"),
+        }
+        if team_name and team_name.lower() != "your team name":
+            init_kwargs["entity"] = team_name
+
+        try:
+            self.wandb = wandb
+            self.wandb.init(**init_kwargs)
+            logger.info(f"W&B logging enabled in {mode} mode")
+        except Exception as exc:
+            self.wandb = None
+            logger.warning(f"W&B init failed, disabling logging: {exc}")
     
     def _get_next_batch(self):
         """Get next batch from iterator, reset if epoch is finished."""
@@ -478,7 +516,7 @@ class Trainer:
                         'grad_norm': f'{total_norm.item():.2f}',
                         'lr': f'{lr:.2e}'
                     })
-                    if self.config.enable_wandb:
+                    if self.wandb is not None:
                         self.wandb.log({
                             'loss_metrics/global_avg_video_loss': latent_loss_show,
                             'loss_metrics/global_avg_action_loss': action_loss_show,
