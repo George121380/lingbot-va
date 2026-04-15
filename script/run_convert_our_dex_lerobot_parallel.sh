@@ -1,4 +1,21 @@
 #!/usr/bin/env bash
+# Runs convert_dex_zarr_to_lerobot.py with multi-process workers to speed up
+# per-episode parquet + MP4 writing (bottleneck is cv2 video encoding).
+#
+# Usage:
+#   bash script/run_convert_our_dex_lerobot_parallel.sh
+#
+# Configurable via env vars (defaults below):
+#   SOURCE_ROOT   - zarr root containing train/ (and optionally eval/)
+#   OUTPUT_ROOT   - output LeRobot dataset directory
+#   TELEOP_ROOT   - Teleop-franka-test repo (used only by validate step)
+#   TASK_TEXT     - natural language task description
+#   SPLITS        - comma-separated zarr splits (default: "train")
+#   FPS, HEIGHT, WIDTH, ACTION_TYPE - see convert_dex_zarr_to_lerobot.py
+#   WORKERS       - number of parallel worker processes (default: 32)
+#   OVERWRITE=1   - overwrite existing OUTPUT_ROOT
+#   PRESERVE_LATENTS=1 - keep latents/ when overwriting
+
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -13,6 +30,7 @@ FPS="${FPS:-30}"
 HEIGHT="${HEIGHT:-256}"
 WIDTH="${WIDTH:-256}"
 ACTION_TYPE="${ACTION_TYPE:-relative}"
+WORKERS="${WORKERS:-32}"
 OVERWRITE="${OVERWRITE:-1}"
 PRESERVE_LATENTS="${PRESERVE_LATENTS:-1}"
 SOURCE_BGR="${SOURCE_BGR:-0}"
@@ -25,6 +43,7 @@ convert_args=(
   --fps "${FPS}"
   --resize "${HEIGHT}" "${WIDTH}"
   --action-type "${ACTION_TYPE}"
+  --workers "${WORKERS}"
 )
 
 if [[ "${OVERWRITE}" == "1" ]]; then
@@ -41,7 +60,7 @@ fi
 
 cd "${REPO_ROOT}"
 
-echo "[1/3] Convert zarr -> LeRobot"
+echo "[1/3] Convert zarr -> LeRobot (workers=${WORKERS})"
 conda run -n dp python tools/convert_dex_zarr_to_lerobot.py "${convert_args[@]}"
 
 echo "[2/3] Check converted LeRobot structure"

@@ -11,7 +11,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import multiprocessing as mp
 import shutil
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import cv2
@@ -266,6 +268,82 @@ def make_info(
     }
 
 
+def _process_episode(job: dict) -> dict:
+    """Process a single episode in a worker process.
+
+    Opens the zarr store independently (safe for concurrent reads), computes
+    actions / states, writes parquet and 3 video files, and returns metadata +
+    action array for the master process to aggregate.
+    """
+    zarr_path = job["zarr_path"]
+    start = job["start"]
+    end = job["end"]
+    episode_index = job["episode_index"]
+    global_start = job["global_start"]
+    task_index = job["task_index"]
+    task_text = job["task_text"]
+    fps = job["fps"]
+    height = job["height"]
+    width = job["width"]
+    action_type = job["action_type"]
+    source_bgr = job["source_bgr"]
+    output_root = Path(job["output_root"])
+
+    root = zarr.open(str(zarr_path), mode="r")
+    length = end - start
+
+    arm = np.asarray(root["arm_data"][start:end], dtype=np.float64)
+    hand = np.asarray(root["hand_data"][start:end], dtype=np.float64)
+
+    state = np.concatenate([arm_state_to_9d(arm), hand], axis=-1).astype(np.float32)
+    if action_type == "relative":
+        action = relative_actions(hand, arm)
+    else:
+        action = absolute_actions(hand, arm)
+
+    chunk = episode_index // 1000
+    write_parquet(
+        output_root / "data" / f"chunk-{chunk:03d}" / f"episode_{episode_index:06d}.parquet",
+        episode_index=episode_index,
+        global_start=global_start,
+        task_index=task_index,
+        fps=fps,
+        action=action,
+        state=state,
+    )
+
+    for zarr_key, video_key in CAMERA_MAP.items():
+        write_video(
+            output_root / "videos" / f"chunk-{chunk:03d}" / video_key / f"episode_{episode_index:06d}.mp4",
+            root[zarr_key],
+            start,
+            end,
+            fps=fps,
+            height=height,
+            width=width,
+            source_bgr=source_bgr,
+        )
+
+    frame_index = np.arange(length, dtype=np.int64)
+    stats = {
+        "episode_index": scalar_stats(np.full(length, episode_index)),
+        "index": scalar_stats(np.arange(global_start, global_start + length)),
+        "frame_index": scalar_stats(frame_index),
+        "task_index": scalar_stats(np.full(length, task_index)),
+        "timestamp": scalar_stats(frame_index.astype(np.float32) / float(fps)),
+        "action": vector_stats(action),
+        "observation.state": vector_stats(state),
+    }
+
+    return {
+        "episode_index": episode_index,
+        "length": length,
+        "action": action,
+        "task_text": task_text,
+        "stats": stats,
+    }
+
+
 def convert(args: argparse.Namespace) -> None:
     input_root = Path(args.input).expanduser().resolve()
     output_root = Path(args.output).expanduser().resolve()
@@ -296,6 +374,8 @@ def convert(args: argparse.Namespace) -> None:
         "task": args.task_text,
     })
 
+    # --- Build job list for all episodes across splits ---
+    jobs = []
     for split_name, split_dir in split_dirs:
         root = zarr.open(str(split_dir), mode="r")
         missing = [key for key in ["arm_data", "hand_data", "episode_ends"] if key not in root]
@@ -308,93 +388,82 @@ def convert(args: argparse.Namespace) -> None:
         print(f"[{split_name}] {len(episode_ends)} episodes, {int(episode_ends[-1]) if len(episode_ends) else 0} frames")
 
         for local_ep, (start, end) in enumerate(zip(episode_starts, episode_ends)):
-            start = int(start)
-            end = int(end)
+            start, end = int(start), int(end)
             length = end - start
             if length <= 0:
                 raise ValueError(f"Invalid episode length in {split_dir}: start={start}, end={end}")
-
-            arm = np.asarray(root["arm_data"][start:end], dtype=np.float64)
-            hand = np.asarray(root["hand_data"][start:end], dtype=np.float64)
-            if arm.shape[1] != 12 or hand.shape[1] != 40:
-                raise ValueError(
-                    f"Expected arm_data dim 12 and hand_data dim 40, got {arm.shape} and {hand.shape}"
-                )
-
-            state = np.concatenate([arm_state_to_9d(arm), hand], axis=-1).astype(np.float32)
-            if args.action_type == "relative":
-                action = relative_actions(hand, arm)
-            else:
-                action = absolute_actions(hand, arm)
-            if action.shape[1] != action_dim or state.shape[1] != action_dim:
-                raise AssertionError(f"Unexpected action/state shapes: {action.shape}, {state.shape}")
-
-            chunk = episode_index // 1000
-            parquet_path = output_root / "data" / f"chunk-{chunk:03d}" / f"episode_{episode_index:06d}.parquet"
-            write_parquet(
-                parquet_path,
-                episode_index=episode_index,
-                global_start=global_index,
-                task_index=task_index,
-                fps=args.fps,
-                action=action,
-                state=state,
-            )
-
-            for zarr_key, video_key in CAMERA_MAP.items():
-                video_path = (
-                    output_root / "videos" / f"chunk-{chunk:03d}" /
-                    video_key / f"episode_{episode_index:06d}.mp4"
-                )
-                write_video(
-                    video_path,
-                    root[zarr_key],
-                    start,
-                    end,
-                    fps=args.fps,
-                    height=height,
-                    width=width,
-                    source_bgr=args.source_bgr,
-                )
-
-            episode = {
+            jobs.append({
+                "zarr_path": str(split_dir),
+                "start": start,
+                "end": end,
                 "episode_index": episode_index,
-                "tasks": [args.task_text],
-                "length": length,
-                "action_config": [{
-                    "start_frame": 0,
-                    "end_frame": length,
-                    "action_text": args.task_text,
-                    "skill": "",
-                }],
-            }
-            append_jsonl(output_root / "meta" / "episodes.jsonl", episode)
-            append_jsonl(output_root / "meta" / "episodes_ori.jsonl", {
-                "episode_index": episode_index,
-                "tasks": [args.task_text],
-                "length": length,
+                "global_start": global_index,
+                "task_index": task_index,
+                "task_text": args.task_text,
+                "fps": args.fps,
+                "height": height,
+                "width": width,
+                "action_type": args.action_type,
+                "source_bgr": args.source_bgr,
+                "output_root": str(output_root),
+                "split_name": split_name,
+                "local_ep": local_ep,
             })
-
-            frame_index = np.arange(length, dtype=np.int64)
-            stats = {
-                "episode_index": scalar_stats(np.full(length, episode_index)),
-                "index": scalar_stats(np.arange(global_index, global_index + length)),
-                "frame_index": scalar_stats(frame_index),
-                "task_index": scalar_stats(np.full(length, task_index)),
-                "timestamp": scalar_stats(frame_index.astype(np.float32) / float(args.fps)),
-                "action": vector_stats(action),
-                "observation.state": vector_stats(state),
-            }
-            append_jsonl(output_root / "meta" / "episodes_stats.jsonl", {
-                "episode_index": episode_index,
-                "stats": stats,
-            })
-
-            all_actions.append(action)
             global_index += length
             total_frames += length
             episode_index += 1
-            print(f"  episode {episode_index - 1:06d}: source_ep={local_ep}, frames={length}")
+
+    # --- Process episodes (parallel or sequential) ---
+    num_workers = getattr(args, "workers", 1)
+    results: list[dict] = []
+
+    if num_workers > 1:
+        print(f"Processing {len(jobs)} episodes with {num_workers} workers ...")
+        with ProcessPoolExecutor(max_workers=num_workers) as pool:
+            futures = {pool.submit(_process_episode, job): job for job in jobs}
+            done_count = 0
+            for future in as_completed(futures):
+                result = future.result()
+                results.append(result)
+                done_count += 1
+                if done_count % 20 == 0 or done_count == len(jobs):
+                    print(f"  completed {done_count}/{len(jobs)} episodes")
+    else:
+        for job in jobs:
+            result = _process_episode(job)
+            results.append(result)
+            print(f"  episode {result['episode_index']:06d}: "
+                  f"source_ep={job['local_ep']}, frames={result['length']}")
+
+    # --- Write metadata sequentially in episode_index order ---
+    results.sort(key=lambda r: r["episode_index"])
+    for result in results:
+        ep_idx = result["episode_index"]
+        length = result["length"]
+        task_text = result["task_text"]
+
+        episode = {
+            "episode_index": ep_idx,
+            "tasks": [task_text],
+            "length": length,
+            "action_config": [{
+                "start_frame": 0,
+                "end_frame": length,
+                "action_text": task_text,
+                "skill": "",
+            }],
+        }
+        append_jsonl(output_root / "meta" / "episodes.jsonl", episode)
+        append_jsonl(output_root / "meta" / "episodes_ori.jsonl", {
+            "episode_index": ep_idx,
+            "tasks": [task_text],
+            "length": length,
+        })
+        append_jsonl(output_root / "meta" / "episodes_stats.jsonl", {
+            "episode_index": ep_idx,
+            "stats": result["stats"],
+        })
+        all_actions.append(result["action"])
 
     all_actions_np = np.concatenate(all_actions, axis=0)
     q01, q99 = safe_quantiles(all_actions_np)
@@ -446,6 +515,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--empty-emb-source", default=str(DEFAULT_EMPTY_EMB), help="Optional empty_emb.pt to copy.")
     parser.add_argument("--overwrite", action="store_true", help="Replace output directory if it exists.")
     parser.add_argument("--preserve-latents", action="store_true", help="When overwriting, keep an existing latents/ directory.")
+    parser.add_argument("--workers", type=int, default=1, help="Number of parallel workers for episode processing. >1 enables multiprocessing.")
     return parser.parse_args()
 
 

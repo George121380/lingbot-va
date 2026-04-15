@@ -54,19 +54,7 @@
 | timing_log_interval | 50 | `LINGBOT_VA_TIMING_LOG_INTERVAL` | 每 N 步输出计时统计 |
 | enable_timing | True | `LINGBOT_VA_ENABLE_TIMING=0` 关闭 | 子步骤计时开关 |
 
-## 1. 检查数据完整性
-
-```bash
-cd /share-2/code/fanqilin/peiqi/lingbot-va
-
-conda run -n lingbot-va python tools/check_robotwin_lerobot_dataset.py \
-  --dataset /share-2/code/fanqilin/peiqi/dataset/robotwin-clean-and-aug-lerobot \
-  --report /share-2/code/fanqilin/peiqi/lingbot-va/train_out/robotwin_dataset_check_full.json
-```
-
-通过则输出 `Validation passed for ...`；失败则报告写入指定 JSON 文件。
-
-## 2. 正式 8 卡训练（推荐）
+## 1. 正式 8 卡训练（推荐）
 
 ```bash
 cd /share-2/code/fanqilin/peiqi/lingbot-va
@@ -111,7 +99,7 @@ tmux send-keys -t training "bash train_out/run_training.sh" Enter
 tmux attach -t training
 ```
 
-## 3. 训练速度参考
+## 2. 训练速度参考
 
 在当前 B300 服务器上实测（bs=1, grad_accum=8）:
 
@@ -122,7 +110,7 @@ tmux attach -t training
 
 增大 batch_size 可提高显存利用率和吞吐量，但需注意：同一 batch 内样本帧数差异越大，padding 浪费越多。建议根据实际显存余量逐步调大 batch_size（2、4、...）并观察 OOM 情况。
 
-## 4. 在线 W&B
+## 3. 在线 W&B
 
 先登录:
 
@@ -144,9 +132,9 @@ wandb sync /share-2/code/fanqilin/peiqi/lingbot-va/wandb/offline-run-XXXXXXXX-XX
 export WANDB_BASE_URL=...
 ```
 
-## 5. Smoke Test
+## 4. Smoke Test
 
-### 5.1 8 卡快速验证（单任务子集）
+### 4.1 8 卡快速验证（单任务子集）
 
 ```bash
 cd /share-2/code/fanqilin/peiqi/lingbot-va
@@ -166,7 +154,7 @@ bash script/run_va_posttrain.sh \
   --save-root /share-2/code/fanqilin/peiqi/lingbot-va/train_out/smoke_8gpu
 ```
 
-### 5.2 全数据集验证（1 步）
+### 4.2 全数据集验证（1 步）
 
 ```bash
 cd /share-2/code/fanqilin/peiqi/lingbot-va
@@ -188,7 +176,7 @@ bash script/run_va_posttrain.sh \
   --save-root /share-2/code/fanqilin/peiqi/lingbot-va/train_out/smoke_full_dataset
 ```
 
-## 6. 训练后做推理/评测
+## 5. 训练后做推理/评测
 
 训练结束后，需要修改以下文件的 `attn_mode`:
 
@@ -225,7 +213,7 @@ find train_out/robotwin_train/checkpoints -name config.json -path "*/transformer
 
 另外注意 RoboTwin 评测需要 `sapien==3.0.0b1` 版本（参考 issue #27）。
 
-## 7. 子步骤计时统计
+## 6. 子步骤计时统计
 
 训练代码中已集成计时功能，默认开启。每 50 个 optimizer step 输出一次统计:
 
@@ -245,7 +233,7 @@ find train_out/robotwin_train/checkpoints -name config.json -path "*/transformer
 关闭计时: 设置 `LINGBOT_VA_ENABLE_TIMING=0`。
 调整输出频率: 设置 `LINGBOT_VA_TIMING_LOG_INTERVAL=100`（每 100 步输出一次）。
 
-## 8. 预期训练效果（来自 GitHub issue #27）
+## 7. 预期训练效果（来自 GitHub issue #27）
 
 | 步数 | 成功率（demo_clean, 50 runs/task） |
 |------|----------------------------------|
@@ -254,13 +242,13 @@ find train_out/robotwin_train/checkpoints -name config.json -path "*/transformer
 
 以上数据来自用户 jiachengliu3 使用 8 GPU + grad_accum=8 的复现结果。
 
-## 9. B300 GPU 特殊说明
+## 8. B300 GPU 特殊说明
 
 - **NCCL_IB_DISABLE=1**: 已写入 `script/run_va_posttrain.sh`，无需手动设置。B300 (sm_103) 上 NCCL IB 传输会导致 `RuntimeError: Invalid argument`。
 - **显存利用**: bs=1 时约 42GB/275GB。现已支持更大 batch_size（通过 `collate_variable_length` 自动 padding 变长序列并在 FlexAttn 中 mask 掉 padding tokens），可按需调大以提高利用率。
 - **TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC**: 首步 CUDA 编译耗时较长，需设为 1800 以避免 NCCL watchdog 误报。
 
-## 10. batch_size > 1 支持说明
+## 9. batch_size > 1 支持说明
 
 ### 背景
 
@@ -289,7 +277,7 @@ find train_out/robotwin_train/checkpoints -name config.json -path "*/transformer
 - 建议逐步调大 batch_size 并监控显存使用和训练 loss，确认效果正常
 - 增大 batch_size 后应相应减小 `gradient_accumulation_steps`，保持有效 batch size 不变
 
-## 11. 详细调整日志
+## 10. 详细调整日志
 
 所有参数选择的完整理由和调试过程记录在:
 
