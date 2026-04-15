@@ -47,6 +47,10 @@ log_rank=${LOG_RANK}
 torchft_lighthouse=${TORCHFT_LIGHTHOUSE}
 config_name=${CONFIG_NAME}
 
+## NCCL workaround for B300 GPUs (sm_103): IB transport causes "Invalid argument"
+## in all_reduce with PyTorch 2.11 + CUDA 12.8 + NCCL 2.28.9.
+export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}
+
 ## cmd setting
 export TOKENIZERS_PARALLELISM=false
 local_ranks_filter_args=()

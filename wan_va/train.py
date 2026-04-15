@@ -24,6 +24,7 @@ from configs import VA_CONFIGS
 from distributed.fsdp import shard_model, apply_ac
 from distributed.util import (
     _configure_model, 
+    distributed_barrier,
     init_distributed, 
     dist_mean, 
     dist_max
@@ -44,6 +45,8 @@ from utils import (
 
 from dataset import MultiLatentLeRobotDataset
 import gc
+import time
+from collections import defaultdict
 
 
 class Trainer:
@@ -132,6 +135,11 @@ class Trainer:
 
         self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
         self.train_loader_iter = None
+
+        # Sub-step timing profiler
+        self._timing_enabled = os.getenv("LINGBOT_VA_ENABLE_TIMING", "1") == "1"
+        self._timing_log_interval = int(os.getenv("LINGBOT_VA_TIMING_LOG_INTERVAL", "50"))
+        self._timing_records = defaultdict(list)
         # if hasattr(config, 'resume_from') and config.resume_from:
         #     self._load_training_state(config.resume_from)
 
@@ -333,37 +341,114 @@ class Trainer:
 
     def _train_step(self, batch, batch_idx):
         """Train a single batch, returns losses for logging."""
+        te = self._timing_enabled
+
+        if te:
+            torch.cuda.synchronize()
+            t0 = time.monotonic()
+
         batch = self.convert_input_format(batch)
+
+        if te:
+            torch.cuda.synchronize()
+            t1 = time.monotonic()
+
         input_dict = self._prepare_input_dict(batch)
-        
+
+        if te:
+            torch.cuda.synchronize()
+            t2 = time.monotonic()
+
         should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0
-        
+
         if not should_sync:
             self.transformer.set_requires_gradient_sync(False)
         else:
             self.transformer.set_requires_gradient_sync(True)
 
         output = self.transformer(input_dict, train_mode=True)
+
+        if te:
+            torch.cuda.synchronize()
+            t3 = time.monotonic()
+
         latent_loss, action_loss = self.compute_loss(input_dict, output)
         loss = latent_loss + action_loss
 
         loss.backward()
 
+        if te:
+            torch.cuda.synchronize()
+            t4 = time.monotonic()
+
         losses = {'latent_loss': latent_loss.detach(), 'action_loss': action_loss.detach()}
-        
+
         # Only update weights after accumulating gradients
         if should_sync:
             total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
             self.optimizer.step()
             self.lr_scheduler.step()
             self.optimizer.zero_grad()
-            
+
             losses['total_norm'] = total_norm
             losses['should_log'] = True
+
+            if te:
+                torch.cuda.synchronize()
+                t5 = time.monotonic()
+                self._timing_records['optimizer_step'].append(t5 - t4)
         else:
             losses['should_log'] = False
 
+        if te:
+            self._timing_records['data_to_device'].append(t1 - t0)
+            self._timing_records['prepare_input'].append(t2 - t1)
+            self._timing_records['forward'].append(t3 - t2)
+            self._timing_records['loss_and_backward'].append(t4 - t3)
+
         return losses
+
+    def _log_timing_stats(self, final=False):
+        """Log sub-step timing statistics."""
+        import numpy as np
+        tag = "FINAL TIMING" if final else f"TIMING (step {self.step})"
+        lines = [f"===== {tag} STATS ====="]
+        total_per_step = []
+        for key in ['data_loading', 'data_to_device', 'prepare_input',
+                     'forward', 'loss_and_backward', 'optimizer_step',
+                     'barrier_sync']:
+            vals = self._timing_records.get(key, [])
+            if not vals:
+                continue
+            arr = np.array(vals)
+            lines.append(
+                f"  {key:20s}: mean={arr.mean():.4f}s  std={arr.std():.4f}s  "
+                f"min={arr.min():.4f}s  max={arr.max():.4f}s  n={len(arr)}"
+            )
+            if key in ('data_loading', 'data_to_device', 'prepare_input',
+                        'forward', 'loss_and_backward'):
+                total_per_step.append(arr)
+        if total_per_step:
+            min_len = min(len(a) for a in total_per_step)
+            step_total = sum(a[:min_len] for a in total_per_step)
+            lines.append(
+                f"  {'TOTAL_per_microbatch':20s}: mean={step_total.mean():.4f}s  "
+                f"std={step_total.std():.4f}s  min={step_total.min():.4f}s  "
+                f"max={step_total.max():.4f}s"
+            )
+        lines.append("=" * 50)
+        msg = "\n".join(lines)
+        logger.info(msg)
+        if self.wandb is not None:
+            for key, vals in self._timing_records.items():
+                if vals:
+                    arr = np.array(vals)
+                    self.wandb.log({
+                        f'timing/{key}_mean': arr.mean(),
+                        f'timing/{key}_max': arr.max(),
+                    }, step=self.step)
+        # Reset records after logging
+        self._timing_records = defaultdict(list)
 
     def save_checkpoint(self,):
         """Save model checkpoint in the same format as pretrained model."""
@@ -414,7 +499,7 @@ class Trainer:
 
             # Synchronize all processes after saving
             if dist.is_initialized():
-                dist.barrier()
+                distributed_barrier()
 
         except Exception as e:
             if self.config.rank == 0:
@@ -423,7 +508,7 @@ class Trainer:
                 logger.error(traceback.format_exc())
             # Ensure all processes stay synchronized even on error
             if dist.is_initialized():
-                dist.barrier()
+                distributed_barrier()
 
     def _load_training_state(self, checkpoint_path):
         """Load training state (optimizer + step) after FSDP and optimizer creation."""
@@ -454,7 +539,7 @@ class Trainer:
 
         # Synchronize all ranks
         if dist.is_initialized():
-            dist.barrier()
+            distributed_barrier()
 
     def train(self):
         """Main training loop - train by steps instead of epochs."""
@@ -477,8 +562,14 @@ class Trainer:
 
         while self.step < self.config.num_steps:
             # Get next batch (handles epoch reset automatically)
+            if self._timing_enabled:
+                torch.cuda.synchronize()
+                _t_load_start = time.monotonic()
             batch = self._get_next_batch()
-            
+            if self._timing_enabled:
+                _t_load_end = time.monotonic()
+                self._timing_records['data_loading'].append(_t_load_end - _t_load_start)
+
             losses = self._train_step(batch, step_in_accumulation)
             
             # Accumulate losses for logging
@@ -533,10 +624,28 @@ class Trainer:
                         logger.info(f"Starting save model at step {self.step}")
                     self.save_checkpoint()
 
+            if self._timing_enabled:
+                torch.cuda.synchronize()
+                _t_barrier_start = time.monotonic()
+
             if dist.is_initialized():
-                dist.barrier()
+                distributed_barrier()
+
+            if self._timing_enabled:
+                torch.cuda.synchronize()
+                _t_barrier_end = time.monotonic()
+                self._timing_records['barrier_sync'].append(_t_barrier_end - _t_barrier_start)
+
+            # Periodic timing stats report (only after optimizer steps)
+            if (self._timing_enabled and self.config.rank == 0
+                    and losses.get('should_log', False)
+                    and self.step > 0
+                    and self.step % self._timing_log_interval == 0):
+                self._log_timing_stats()
 
         progress_bar.close()
+        if self._timing_enabled and self.config.rank == 0:
+            self._log_timing_stats(final=True)
         logger.info("Training completed!")
 
 
