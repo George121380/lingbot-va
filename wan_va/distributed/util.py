@@ -1,4 +1,4 @@
-# Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+ # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import os
 
 import torch
@@ -9,6 +9,24 @@ def _use_distributed_workers():
     return dist.is_initialized() and dist.get_world_size() > 1
 
 
+def distributed_barrier():
+    if not dist.is_initialized():
+        return
+
+    backend = str(dist.get_backend()).lower()
+    if backend == "nccl" and torch.cuda.is_available():
+        # Torch 2.11 + CUDA 12.8 on this node is unstable for NCCL barrier:
+        # implicit device guessing can segfault, while barrier(device_ids=...)
+        # raises Invalid argument. A 1-element all_reduce gives us the same
+        # synchronization point without touching the broken barrier path.
+        sync = torch.zeros(1, device=torch.cuda.current_device())
+        dist.all_reduce(sync, op=dist.ReduceOp.SUM)
+        torch.cuda.synchronize(torch.cuda.current_device())
+        return
+
+    dist.barrier()
+
+
 def _configure_model(model, shard_fn, param_dtype, device, eval_mode=True):
     """
     TODO
@@ -16,7 +34,7 @@ def _configure_model(model, shard_fn, param_dtype, device, eval_mode=True):
     if eval_mode:
         model.eval().requires_grad_(False)
     if _use_distributed_workers():
-        dist.barrier()
+        distributed_barrier()
 
     if _use_distributed_workers():
         model = shard_fn(model)

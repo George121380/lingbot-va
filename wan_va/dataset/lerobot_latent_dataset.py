@@ -10,11 +10,77 @@ from tqdm import tqdm
 from multiprocessing import Pool, get_context
 from functools import partial
 import torch
+import torch.nn.functional as F_pad_module
 from einops import rearrange
 from torch.utils.data import DataLoader
 from scipy.spatial.transform import Rotation as R
 from lerobot.constants import HF_LEROBOT_HOME
 import json
+
+
+def collate_variable_length(batch):
+    """Custom collate function that pads variable-length frame tensors to the
+    per-batch maximum and creates validity masks.
+
+    Each sample dict is expected to contain:
+        latents      (C, F, H, W)       – F varies across samples
+        actions      (C, F_a, N, 1)     – F_a varies across samples
+        actions_mask (C, F_a, N, 1)     – same shape as actions
+        text_emb     (S, D)             – fixed shape
+    """
+    max_latent_f = max(s['latents'].shape[1] for s in batch)
+    max_action_f = max(s['actions'].shape[1] for s in batch)
+
+    padded_latents = []
+    padded_actions = []
+    padded_actions_masks = []
+    latent_masks = []
+    text_embs = []
+    latent_num_frames_list = []
+    action_num_frames_list = []
+
+    for s in batch:
+        f_l = s['latents'].shape[1]
+        f_a = s['actions'].shape[1]
+
+        # Pad latents along F dimension (dim=1 of C,F,H,W)
+        pad_l = max_latent_f - f_l
+        if pad_l > 0:
+            # F.pad order: last dim first → (W_left, W_right, H_left, H_right, F_left, F_right)
+            padded_latents.append(
+                F_pad_module.pad(s['latents'], (0, 0, 0, 0, 0, pad_l)))
+        else:
+            padded_latents.append(s['latents'])
+
+        # Create latent_mask: True for valid frames, False for padded
+        mask = torch.zeros(1, max_latent_f, 1, 1, dtype=torch.bool)
+        mask[:, :f_l] = True
+        latent_masks.append(mask)
+        latent_num_frames_list.append(f_l)
+
+        # Pad actions and actions_mask along F dimension (dim=1 of C,F,N,1)
+        pad_a = max_action_f - f_a
+        if pad_a > 0:
+            padded_actions.append(
+                F_pad_module.pad(s['actions'], (0, 0, 0, 0, 0, pad_a)))
+            padded_actions_masks.append(
+                F_pad_module.pad(s['actions_mask'], (0, 0, 0, 0, 0, pad_a)))
+        else:
+            padded_actions.append(s['actions'])
+            padded_actions_masks.append(s['actions_mask'])
+        action_num_frames_list.append(f_a)
+
+        text_embs.append(s['text_emb'])
+
+    return {
+        'latents': torch.stack(padded_latents),
+        'actions': torch.stack(padded_actions),
+        'actions_mask': torch.stack(padded_actions_masks),
+        'text_emb': torch.stack(text_embs),
+        'latent_mask': torch.stack(latent_masks),
+        'latent_num_frames': torch.tensor(latent_num_frames_list, dtype=torch.long),
+        'action_num_frames': torch.tensor(action_num_frames_list, dtype=torch.long),
+    }
 
 
 class DatasetShardError(RuntimeError):

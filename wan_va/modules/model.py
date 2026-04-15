@@ -35,8 +35,13 @@ __all__ = ['WanTransformer3DModel']
 
 
 def custom_sdpa(q, k, v):
-    out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
-                                         v.transpose(1, 2))
+    with torch.nn.attention.sdpa_kernel([
+        torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+        torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
+        torch.nn.attention.SDPBackend.MATH,
+    ]):
+        out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
+                                             v.transpose(1, 2))
     return out.transpose(1, 2)
 
 class FlexAttnFunc(nn.Module):
@@ -93,25 +98,61 @@ class FlexAttnFunc(nn.Module):
     @staticmethod
     @torch.no_grad()
     def init_mask(
-        latent_shape, 
-        action_shape, 
-        padded_length, 
+        latent_shape,
+        action_shape,
+        padded_length,
         chunk_size,
         window_size,
         patch_size,
         device,
+        latent_num_frames=None,
+        action_num_frames=None,
     ):
         torch._inductor.config.realize_opcount_threshold = 100
         B, _, L_F, L_H, L_W = latent_shape
         _, _, A_F, A_H, A_W = action_shape
+        p_f, p_h, p_w = patch_size
+
+        # Build per-token seq_ids; padded frame tokens get seq_id = -1
+        # Move num_frames to CPU for use as slice indices (they may be on GPU)
+        latent_nf_cpu = latent_num_frames.cpu() if latent_num_frames is not None else None
+        action_nf_cpu = action_num_frames.cpu() if action_num_frames is not None else None
 
         latent_seq_id = torch.arange(B)[:, None, None, None].\
-            expand(-1, L_F // patch_size[0], L_H // patch_size[1], L_W // patch_size[2]).flatten()
-        action_seq_id = torch.arange(B)[:, None, None, None].expand(-1, A_F, A_H, A_W).flatten()
+            expand(-1, L_F // p_f, L_H // p_h, L_W // p_w).clone()
+        if latent_nf_cpu is not None:
+            for b in range(B):
+                nf = latent_nf_cpu[b].item() // p_f
+                latent_seq_id[b, nf:, :, :] = -1
+        latent_seq_id = latent_seq_id.flatten()
+
+        action_seq_id = torch.arange(B)[:, None, None, None].\
+            expand(-1, A_F, A_H, A_W).clone()
+        if action_nf_cpu is not None:
+            for b in range(B):
+                nf = action_nf_cpu[b].item()
+                action_seq_id[b, nf:, :, :] = -1
+        action_seq_id = action_seq_id.flatten()
+
         seq_ids = torch.cat([latent_seq_id] * 2 + [action_seq_id] * 2)
 
-        latent_frame_id = torch.arange(L_F)[None, :, None, None].expand(B, -1, L_H // patch_size[1], L_W // patch_size[2])[None].flatten()
-        action_frame_id = torch.arange(A_F)[None, :, None, None].expand(B, -1, A_H, A_W)[None].flatten()
+        # Build per-token frame_ids; padded frame tokens get frame_id = -1
+        latent_frame_id = torch.arange(L_F)[None, :, None, None].\
+            expand(B, -1, L_H // p_h, L_W // p_w).clone()
+        if latent_nf_cpu is not None:
+            for b in range(B):
+                nf = latent_nf_cpu[b].item()
+                latent_frame_id[b, nf:, :, :] = -1
+        latent_frame_id = latent_frame_id.flatten()
+
+        action_frame_id = torch.arange(A_F)[None, :, None, None].\
+            expand(B, -1, A_H, A_W).clone()
+        if action_nf_cpu is not None:
+            for b in range(B):
+                nf = action_nf_cpu[b].item()
+                action_frame_id[b, nf:, :, :] = -1
+        action_frame_id = action_frame_id.flatten()
+
         frame_ids = torch.cat([latent_frame_id // chunk_size * 2] * 2 + [action_frame_id // chunk_size * 2 + 1] * 2)
 
         noise_ids = torch.cat(
@@ -762,13 +803,15 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                       condition_action_hidden_states.shape[1],
                       padded_length]
 
-        FlexAttnFunc.init_mask(latent_dict['noisy_latents'].shape, 
-                               action_dict['noisy_latents'].shape, 
-                               padded_length, 
+        FlexAttnFunc.init_mask(latent_dict['noisy_latents'].shape,
+                               action_dict['noisy_latents'].shape,
+                               padded_length,
                                input_dict["chunk_size"],
                                window_size=input_dict['window_size'],
                                patch_size=self.patch_size,
-                               device=hidden_states.device
+                               device=hidden_states.device,
+                               latent_num_frames=latent_dict.get('latent_num_frames', None),
+                               action_num_frames=action_dict.get('action_num_frames', None),
                                )
 
         for block in self.blocks:

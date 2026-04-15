@@ -43,7 +43,7 @@ from utils import (
     FlowMatchScheduler
 )
 
-from dataset import MultiLatentLeRobotDataset
+from dataset import MultiLatentLeRobotDataset, collate_variable_length
 import gc
 import time
 from collections import defaultdict
@@ -120,9 +120,10 @@ class Trainer:
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=config.batch_size,
-            shuffle=(train_sampler is None), 
+            shuffle=(train_sampler is None),
             num_workers=config.load_worker,
             sampler=train_sampler,
+            collate_fn=collate_variable_length,
         )
 
         self.train_scheduler_latent = FlowMatchScheduler(shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True)
@@ -267,22 +268,27 @@ class Trainer:
         # Generate grid_id following infer code (no batch dimension yet)
         # For action mode: get_mesh_id(shape[-3], shape[-2], shape[-1], t=1, f_w=1, f_shift, action=True)
         latent_dict = self._add_noise(
-            latent=batch_dict['latents'], 
-            train_scheduler=self.train_scheduler_latent, 
-            action_mask=None, 
+            latent=batch_dict['latents'],
+            train_scheduler=self.train_scheduler_latent,
+            action_mask=batch_dict.get('latent_mask', None),
             action_mode=False,
             noisy_cond_prob=0.5)
-        
+
         action_dict = self._add_noise(
-            latent=batch_dict['actions'], 
-            train_scheduler=self.train_scheduler_action, 
-            action_mask=batch_dict['actions_mask'], 
+            latent=batch_dict['actions'],
+            train_scheduler=self.train_scheduler_action,
+            action_mask=batch_dict['actions_mask'],
             action_mode=True,
             noisy_cond_prob=0.0)
 
         latent_dict['text_emb'] = batch_dict['text_emb']
         action_dict['text_emb'] = batch_dict['text_emb']
         action_dict['actions_mask'] = batch_dict['actions_mask']
+
+        # Propagate padding metadata for attention masking and loss normalization
+        latent_dict['latent_mask'] = batch_dict.get('latent_mask', None)
+        latent_dict['latent_num_frames'] = batch_dict.get('latent_num_frames', None)
+        action_dict['action_num_frames'] = batch_dict.get('action_num_frames', None)
 
         input_dict = {
             'latent_dict': latent_dict,
@@ -321,7 +327,14 @@ class Trainer:
         # Sum per frame and compute mask per frame
         latent_loss_per_frame = latent_loss.sum(dim=1)  # (B*F,)
         latent_mask_per_frame = torch.ones_like(latent_loss).sum(dim=1)  # (B*F,)
-        latent_loss = (latent_loss_per_frame / (latent_mask_per_frame + 1e-6)).mean()
+        latent_loss_per_frame = latent_loss_per_frame / (latent_mask_per_frame + 1e-6)
+        # Only average over valid (non-padded) frames
+        latent_frame_mask = input_dict['latent_dict'].get('latent_mask', None)
+        if latent_frame_mask is not None:
+            frame_valid = latent_frame_mask[:, 0, :, 0, 0].flatten().float()  # (B*F,)
+            latent_loss = (latent_loss_per_frame * frame_valid).sum() / frame_valid.sum().clamp(min=1)
+        else:
+            latent_loss = latent_loss_per_frame.mean()
 
         # Frame-wise action loss calculation
         action_loss = F.mse_loss(action_pred.float(), input_dict['action_dict']['targets'].float().detach(), reduction='none')
@@ -332,10 +345,12 @@ class Trainer:
         action_mask = input_dict['action_dict']['actions_mask'].float().permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
         action_loss = action_loss.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
         action_mask = action_mask.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
-        # Sum per frame and normalize by mask per frame
+        # Sum per frame and normalize by mask per frame; only average over valid frames
         action_loss_per_frame = action_loss.sum(dim=1)  # (B*F,)
         action_mask_per_frame = action_mask.sum(dim=1)  # (B*F,)
-        action_loss = (action_loss_per_frame / (action_mask_per_frame + 1e-6)).mean()
+        action_loss_per_frame = action_loss_per_frame / (action_mask_per_frame + 1e-6)
+        valid_action_frames = (action_mask_per_frame > 0).float()
+        action_loss = (action_loss_per_frame * valid_action_frames).sum() / valid_action_frames.sum().clamp(min=1)
 
         return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps
 
